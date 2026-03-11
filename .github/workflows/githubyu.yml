@@ -423,12 +423,12 @@ jobs:
           }
           
           # Grant full permissions to system directories
-          icacls "C:\ProgramData" /grant "${username}:(OI)(CI)F" /T /C /Q 2>$null
-          icacls "C:\Program Files" /grant "${username}:(OI)(CI)F" /T /C /Q 2>$null
-          icacls "C:\Program Files (x86)" /grant "${username}:(OI)(CI)F" /T /C /Q 2>$null
+          icacls "C:\ProgramData" /grant "${username}:(OI)(CI)F" /C /Q 2>$null
+          icacls "C:\Program Files" /grant "${username}:(OI)(CI)F" /C /Q 2>$null
+          icacls "C:\Program Files (x86)" /grant "${username}:(OI)(CI)F"  /C /Q 2>$null
           
           # Grant write access to Windows for full admin capabilities
-          icacls "C:\Windows" /grant "${username}:(OI)(CI)M" /T /C /Q 2>$null
+          icacls "C:\Windows" /grant "${username}:(OI)(CI)M"  /C /Q 2>$null
           
           Write-Host ""
           Write-Host "============================================"
