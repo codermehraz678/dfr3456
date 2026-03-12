@@ -4,43 +4,43 @@ on:
   workflow_dispatch:
     inputs:
       hostname:
-        description: "Hostname for this RDP instance (e.g. myserver, dev-machine)"
+        description: "Hostname for this RDP instance"
         required: true
         default: "bullet"
       ts_tailnet:
         description: "Tailscale tailnet (e.g. you@gmail.com)"
         required: true
       ts_api_key:
-        description: "Tailscale API key (device admin, no Bearer)"
+        description: "Tailscale API key"
         required: true
       ts_authkey:
-        description: "Tailscale Auth key (reusable or ephemeral)"
+        description: "Tailscale Auth key"
         required: true
       quick_test:
         description: "Run 5-minute test"
         type: boolean
         default: false
       runtime_minutes:
-        description: "Runtime (max 360; default 355)"
+        description: "Runtime (max 360)"
         default: "355"
       do_purge:
-        description: "Purge matching hostname devices at start"
+        description: "Purge old devices"
         default: "true"
       rdp_count:
-        description: "How many RDP instances (1-10)"
+        description: "RDP instances (1-10)"
         default: "1"
       rdp_username:
-        description: "RDP Username (default: bulletuser)"
+        description: "RDP Username"
         default: "bulletuser"
       rdp_password:
-        description: "RDP Password (default: Bullet@12345)"
+        description: "RDP Password"
         default: "Bullet@12345"
       bonsai_api_key:
-        description: "Bonsai API Key (optional, for Claude Code)"
+        description: "Bonsai API Key"
         required: false
         default: ""
       claude_api_key:
-        description: "Claude API Key (optional, for Claude CLI)"
+        description: "Claude API Key"
         required: false
         default: ""
 
@@ -59,36 +59,32 @@ jobs:
         shell: bash
         run: |
           n=${{ inputs.rdp_count }}
-          if [ "$n" -lt 1 ]; then n=1; fi
-          if [ "$n" -gt 10 ]; then n=10; fi
+          [ "$n" -lt 1 ] && n=1
+          [ "$n" -gt 10 ] && n=10
           include="["
           for i in $(seq 1 $n); do
-            if [ $i -gt 1 ]; then include+=","; fi
+            [ $i -gt 1 ] && include+=","
             include+="{\"id\": $i}"
           done
           include+="]"
           echo "matrix={\"include\":$include}" >> $GITHUB_OUTPUT
-          echo "Matrix: $include"
 
   purge-devices:
     runs-on: ubuntu-latest
     needs: setup
     if: ${{ inputs.do_purge == 'true' }}
     steps:
-      - name: Purge old devices matching hostname
+      - name: Purge old devices
         env:
           TS_TAILNET: ${{ inputs.ts_tailnet }}
           TS_API_KEY: ${{ inputs.ts_api_key }}
           HOSTNAME_INPUT: ${{ inputs.hostname }}
         shell: bash
         run: |
-          hostname_pattern="${HOSTNAME_INPUT:-bullet}"
+          pattern="${HOSTNAME_INPUT:-bullet}"
           devices=$(curl -s -H "Authorization: Bearer $TS_API_KEY" "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices")
-          echo "$devices" | jq -r ".devices[] | select(.hostname | contains(\"$hostname_pattern\")) | .id" | while read device_id; do
-            if [ -n "$device_id" ]; then
-              echo "Deleting device: $device_id"
-              curl -s -X DELETE -H "Authorization: Bearer $TS_API_KEY" "https://api.tailscale.com/api/v2/device/$device_id"
-            fi
+          echo "$devices" | jq -r ".devices[] | select(.hostname | contains(\"$pattern\")) | .id" | while read id; do
+            [ -n "$id" ] && curl -s -X DELETE -H "Authorization: Bearer $TS_API_KEY" "https://api.tailscale.com/api/v2/device/$id"
           done
 
   rdp:
@@ -106,402 +102,187 @@ jobs:
       RDP_PASS: ${{ inputs.rdp_password }}
 
     steps:
-      - name: Set hostname + runtime
+      - name: Set hostname and runtime
         shell: pwsh
         run: |
           $hostname = "${{ inputs.hostname }}"
           if ([string]::IsNullOrEmpty($hostname)) {
-            $rdp_count = "${{ inputs.rdp_count }}"
-            if ([int]$rdp_count -gt 1) {
-              $hostname = "bullet${{ matrix.id }}"
-            } else {
-              $hostname = "bullet"
-            }
+            $hostname = if ([int]"${{ inputs.rdp_count }}" -gt 1) { "bullet${{ matrix.id }}" } else { "bullet" }
           }
           Add-Content -Path $env:GITHUB_ENV -Value "TS_HOSTNAME=$hostname"
-          Write-Host "Hostname: $hostname"
           
-          $runtimeStr = "${{ inputs.runtime_minutes }}"
           $runtime = 355
-          if (-not [string]::IsNullOrEmpty($runtimeStr)) {
-            try { $runtime = [int]$runtimeStr } catch { $runtime = 355 }
-          }
-          if ("${{ inputs.quick_test }}" -eq "true") {
-            $runtime = 5
-          }
-          if ($runtime -lt 1) { $runtime = 355 }
-          if ($runtime -gt 360) { $runtime = 355 }
+          try { $runtime = [int]"${{ inputs.runtime_minutes }}" } catch {}
+          if ("${{ inputs.quick_test }}" -eq "true") { $runtime = 5 }
+          if ($runtime -lt 1 -or $runtime -gt 360) { $runtime = 355 }
           Add-Content -Path $env:GITHUB_ENV -Value "RUNTIME_MINUTES=$runtime"
-          Write-Host "Runtime: $runtime minutes"
+          
+          Write-Host "Hostname: $hostname | Runtime: $runtime min"
 
-      - name: Enable HIGH PERFORMANCE Mode
+      - name: Enable High Performance Mode
         shell: pwsh
         run: |
-          Write-Host "============================================"
-          Write-Host "ENABLING HIGH PERFORMANCE MODE"
-          Write-Host "============================================"
+          Write-Host "Enabling High Performance Mode..."
           
-          # Get current active power plan
-          $currentPlan = powercfg -getactivescheme
-          Write-Host "Current power plan: $currentPlan"
+          # Activate High Performance (standard GUID)
+          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
           
-          # Try to activate High Performance plan (standard GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c)
-          $highPerfGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
-          
-          # Check if High Performance plan exists
-          $plans = powercfg -list
-          if ($plans -match $highPerfGuid) {
-            powercfg -setactive $highPerfGuid
-            Write-Host "Activated High Performance plan: $highPerfGuid"
-          } else {
-            # Use Balanced as fallback and optimize it
-            $balancedGuid = "381b4222-f694-41f0-9685-ff5bb260df2e"
-            powercfg -setactive $balancedGuid
-            Write-Host "Using Balanced plan with optimizations"
+          # Try Ultimate Performance
+          $result = powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1
+          if ($result -match "([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})") {
+            powercfg -setactive $matches[1]
+            Write-Host "Ultimate Performance activated"
           }
           
-          # Try to create Ultimate Performance plan
-          try {
-            $result = powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1
-            if ($result -match "([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})") {
-              $ultimateGuid = $matches[1]
-              powercfg -setactive $ultimateGuid
-              Write-Host "Activated Ultimate Performance plan: $ultimateGuid"
-            }
-          } catch {
-            Write-Host "Ultimate Performance not available, using High Performance"
-          }
-          
-          # Disable USB selective suspend
-          powercfg -setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
-          powercfg -setdcvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
-          
-          # Disable hard disk sleep
-          powercfg -setacvalueindex scheme_current 0012ee47-9041-4b5d-9b77-535fba8b1442 6738e2c4-e8a5-4a42-b16a-e040e7699bb4 0
-          powercfg -setdcvalueindex scheme_current 0012ee47-9041-4b5d-9b77-535fba8b1442 6738e2c4-e8a5-4a42-b16a-e040e7699bb4 0
-          
-          # Disable sleep and hibernate
+          # Disable sleep/hibernate
           powercfg -change -monitor-timeout-ac 0
-          powercfg -change -monitor-timeout-dc 0
           powercfg -change -standby-timeout-ac 0
-          powercfg -change -standby-timeout-dc 0
           powercfg -change -hibernate-timeout-ac 0
-          powercfg -change -hibernate-timeout-dc 0
           powercfg -hibernate off
           
-          # Set processor to maximum performance (0 = minimum, 100 = maximum)
-          powercfg -setacvalueindex scheme_current 54533251-82be-4824-96c1-47b60b740d00 893dee8e-2bef-41e0-89c6-b55d0929964c 100
-          powercfg -setacvalueindex scheme_current 54533251-82be-4824-96c1-47b60b740d00 bc5038f7-23e0-4960-96da-33abaf5935ec 100
-          
-          # Set minimum processor state to 100%
-          powercfg -setacvalueindex scheme_current 54533251-82be-4824-96c1-47b60b740d00 893dee8e-2bef-41e0-89c6-b55d0929964c 100
-          
-          # Disable core parking
-          powercfg -setacvalueindex scheme_current 54533251-82be-4824-96c1-47b60b740d00 0cc5b647-c1df-4637-891a-dec35c318583 0
-          
-          # Increase system cooling policy to active
-          powercfg -setacvalueindex scheme_current 54533251-82be-4824-96c1-47b60b740d00 94d3a615-a899-4ac5-ae2b-e4d8f634367f 1
-          
-          # Apply all power settings
-          powercfg -setactive scheme_current
-          
-          # Disable Windows Animation for better RDP performance
+          # Disable visual effects
           Set-ItemProperty -Path "HKCU:\Control Panel\Desktop\WindowMetrics" -Name "MinAnimate" -Value "0" -ErrorAction SilentlyContinue
-          
-          # Disable visual effects for better RDP performance (2 = best performance)
           Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 2 -ErrorAction SilentlyContinue
           
-          # Allow multiple RDP sessions
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fSingleSessionPerUser" -Value 0 -ErrorAction SilentlyContinue
-          
-          # Optimize network for RDP (disable throttling)
+          # Network optimizations
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" -Name "NetworkThrottlingIndex" -Value 0xffffffff -ErrorAction SilentlyContinue
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" -Name "SystemResponsiveness" -Value 0 -ErrorAction SilentlyContinue
           
-          # Prioritize RDP traffic
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Remote Desktop" -Name "Affinity" -Value 0 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Remote Desktop" -Name "Background Only" -Value 0 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Remote Desktop" -Name "Clock Rate" -Value 10000 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Remote Desktop" -Name "GPU Priority" -Value 8 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Remote Desktop" -Name "Priority" -Value 6 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Remote Desktop" -Name "Scheduling Category" -Value "High" -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Remote Desktop" -Name "SFIO Priority" -Value "High" -ErrorAction SilentlyContinue
-          
-          # Disable unnecessary services for better performance
+          # Stop unnecessary services
           Stop-Service -Name "SysMain" -Force -ErrorAction SilentlyContinue
-          Set-Service -Name "SysMain" -StartupType Disabled -ErrorAction SilentlyContinue
-          
           Stop-Service -Name "DiagTrack" -Force -ErrorAction SilentlyContinue
-          Set-Service -Name "DiagTrack" -StartupType Disabled -ErrorAction SilentlyContinue
           
-          Stop-Service -Name "WSearch" -Force -ErrorAction SilentlyContinue
-          Set-Service -Name "WSearch" -StartupType Disabled -ErrorAction SilentlyContinue
+          # Open firewall for code-server
+          New-NetFirewallRule -DisplayName "code-server" -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
           
-          # Increase RDP connection timeout (no timeout)
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fInheritAutoReconnect" -Value 0 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "MaxConnectionTime" -Value 0 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "MaxDisconnectionTime" -Value 0 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "MaxIdleTime" -Value 0 -ErrorAction SilentlyContinue
-          
-          # Optimize TCP/IP for better network performance
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "DefaultTTL" -Value 64 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "TcpMaxDataRetransmissions" -Value 3 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "TcpTimedWaitDelay" -Value 30 -ErrorAction SilentlyContinue
-          
-          # Increase desktop heap for smoother UI
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\SubSystems" -Name "SharedSection" -Value "1024,20480,10240" -ErrorAction SilentlyContinue
-          
-          Write-Host ""
-          Write-Host "============================================"
-          Write-Host "HIGH PERFORMANCE MODE ENABLED!"
-          Write-Host "============================================"
-          Write-Host "  - Power plan: High/Ultimate Performance"
-          Write-Host "  - Sleep/Hibernate: Disabled"
-          Write-Host "  - CPU: 100% minimum, Max performance"
-          Write-Host "  - Core parking: Disabled"
-          Write-Host "  - Network throttling: Disabled"
-          Write-Host "  - RDP priority: High"
-          Write-Host "  - Visual effects: Disabled"
-          Write-Host "  - Unnecessary services: Stopped"
-          Write-Host "  - TCP/IP: Optimized"
-          Write-Host "  - Desktop heap: Increased"
-          Write-Host "============================================"
+          Write-Host "High Performance Mode ENABLED"
 
       - name: Install Tailscale
         shell: pwsh
         run: |
-          $tailscaleUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-          $installer = "$env:TEMP\tailscale-setup.exe"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $installer = "$env:TEMP\tailscale.exe"
           
-          Write-Host "Downloading Tailscale..."
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          Invoke-WebRequest -Uri $tailscaleUrl -OutFile $installer -UseBasicParsing
-          
-          Write-Host "Installing Tailscale..."
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
           Start-Process -FilePath $installer -ArgumentList "/quiet", "/noreboot" -Wait -NoNewWindow
           
-          $tailscalePath = "${env:ProgramFiles}\Tailscale"
-          if (Test-Path $tailscalePath) {
-            Add-Content -Path $env:GITHUB_PATH -Value $tailscalePath
-            $env:PATH += ";$tailscalePath"
-          }
+          $tsPath = "${env:ProgramFiles}\Tailscale"
+          Add-Content -Path $env:GITHUB_PATH -Value $tsPath
+          $env:PATH += ";$tsPath"
           
-          Write-Host "Tailscale installed"
-          & "$tailscalePath\tailscale.exe" version
+          & "$tsPath\tailscale.exe" version
 
       - name: Connect Tailscale
         shell: pwsh
         env:
           TS_AUTHKEY: ${{ inputs.ts_authkey }}
         run: |
-          $tailscalePath = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          $tsPath = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          Start-Sleep -Seconds 3
           
+          & $tsPath up --authkey="$env:TS_AUTHKEY" --hostname="$env:TS_HOSTNAME" --accept-dns --accept-routes
           Start-Sleep -Seconds 5
           
-          Write-Host "Connecting to Tailscale..."
-          & $tailscalePath up --authkey="$env:TS_AUTHKEY" --hostname="$env:TS_HOSTNAME" --accept-dns --accept-routes
-          Start-Sleep -Seconds 10
-          
-          $tsIp = (& $tailscalePath ip -4 2>$null)
-          if ([string]::IsNullOrEmpty($tsIp)) { $tsIp = "unknown" }
-          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIp"
-          Write-Host "Tailscale IP: $tsIp"
+          $ip = (& $tsPath ip -4 2>$null)
+          if ([string]::IsNullOrEmpty($ip)) { $ip = "unknown" }
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$ip"
+          Write-Host "Tailscale IP: $ip"
 
       - name: Install Chocolatey Packages
         shell: pwsh
         run: |
-          choco install -y git wget vim nano nodejs-lts python3 7zip
+          choco install -y git wget vim nano 7zip --no-progress
+          Write-Host "Base packages installed"
+
+      - name: Install Node.js Latest + npm Latest
+        shell: pwsh
+        run: |
+          # Install latest Node.js via winget
+          winget install OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements
           
+          # Set up npm global path
+          $npmGlobal = "C:\npm-global"
+          New-Item -ItemType Directory -Path $npmGlobal -Force | Out-Null
+          
+          # Refresh PATH
           $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           
-          Write-Host "============================================"
-          Write-Host "Chocolatey packages installed!"
-          Write-Host "============================================"
+          # Update npm to latest version
+          Write-Host "Updating npm to latest version..."
+          npm install -g npm@latest
+          
+          # Configure npm
+          npm config set prefix $npmGlobal
+          $env:PATH = "$npmGlobal;" + $env:PATH
+          Add-Content -Path $env:GITHUB_PATH -Value $npmGlobal
+          
+          # Install global packages
+          npm install -g typescript ts-node nodemon pm2 yarn pnpm
+          
+          Write-Host "Node: $(node --version)"
+          Write-Host "npm: $(npm --version)"
 
-      - name: Install Claude CLI (Stable)
+      - name: Install Claude CLI
         shell: pwsh
         env:
           CLAUDE_API_KEY: ${{ inputs.claude_api_key }}
         run: |
-          Write-Host "============================================"
-          Write-Host "INSTALLING CLAUDE CLI (STABLE VERSION)"
-          Write-Host "============================================"
+          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           
-          # Method 1: Try winget first (official stable)
-          Write-Host "Attempting to install Claude via winget..."
-          $wingetResult = winget install --id Anthropic.Claude --accept-source-agreements --accept-package-agreements 2>&1
-          
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "Claude installed successfully via winget"
-          } else {
-            Write-Host "Winget installation failed, trying alternative method..."
-            
-            # Method 2: Download from official Anthropic releases
-            $claudeUrl = "https://github.com/anthropics/claude-cli/releases/latest/download/claude-windows-x64.exe"
-            $claudeDest = "${env:ProgramFiles}\Claude\claude.exe"
-            
-            try {
-              New-Item -ItemType Directory -Path (Split-Path $claudeDest) -Force | Out-Null
-              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-              Invoke-WebRequest -Uri $claudeUrl -OutFile $claudeDest -UseBasicParsing
-              
-              # Add to PATH
-              $claudePath = Split-Path $claudeDest
-              Add-Content -Path $env:GITHUB_PATH -Value $claudePath
-              $env:PATH += ";$claudePath"
-              
-              Write-Host "Claude installed successfully from official release"
-            } catch {
-              Write-Host "Direct download failed, trying scoop..."
-              
-              # Method 3: Try scoop as fallback
-              try {
-                Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
-                Invoke-RestMethod -Uri "https://get.scoop.sh" | Invoke-Expression
-                scoop install claude 2>$null
-                Write-Host "Claude installed via scoop"
-              } catch {
-                Write-Host "Warning: Could not install Claude CLI. You may need to install it manually."
-              }
-            }
+          $result = winget install --id Anthropic.Claude --accept-source-agreements --accept-package-agreements 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            $url = "https://github.com/anthropics/claude-cli/releases/latest/download/claude-windows-x64.exe"
+            $dest = "${env:ProgramFiles}\Claude\claude.exe"
+            New-Item -ItemType Directory -Path (Split-Path $dest) -Force | Out-Null
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+            Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $dest)
           }
           
-          # Configure Claude API key if provided
           if (-not [string]::IsNullOrEmpty($env:CLAUDE_API_KEY)) {
-            $claudeConfigDir = "$env:USERPROFILE\.claude"
-            New-Item -ItemType Directory -Path $claudeConfigDir -Force | Out-Null
-            Set-Content -Path "$claudeConfigDir\config.json" -Value "{`"api_key`": `"$env:CLAUDE_API_KEY`"}" -Encoding UTF8
-            
-            # Also set for RDP user
-            $userClaudeDir = "C:\Users\$env:RDP_USER\.claude"
-            New-Item -ItemType Directory -Path $userClaudeDir -Force | Out-Null
-            Set-Content -Path "$userClaudeDir\config.json" -Value "{`"api_key`": `"$env:CLAUDE_API_KEY`"}" -Encoding UTF8
-            
-            # Set environment variable
+            @("$env:USERPROFILE\.claude", "C:\Users\$env:RDP_USER\.claude") | ForEach-Object {
+              New-Item -ItemType Directory -Path $_ -Force | Out-Null
+              Set-Content -Path "$_\config.json" -Value "{`"api_key`": `"$env:CLAUDE_API_KEY`"}"
+            }
             [Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", $env:CLAUDE_API_KEY, "User")
-            
-            Write-Host "Claude API key configured"
           }
-          
-          # Verify installation
-          $claudeExe = Get-Command claude -ErrorAction SilentlyContinue
-          if ($claudeExe) {
-            Write-Host "Claude CLI location: $($claudeExe.Source)"
-            claude --version 2>$null
-          }
-          
-          Write-Host "============================================"
-          Write-Host "CLAUDE CLI READY!"
-          Write-Host "============================================"
+          Write-Host "Claude CLI ready"
 
-      - name: Create User with FULL ADMIN Access
+      - name: Create Admin User
         shell: pwsh
         run: |
-          $username = $env:RDP_USER
-          $password = $env:RDP_PASS
+          net user $env:RDP_USER $env:RDP_PASS /add /active:yes /expires:never 2>$null
+          net localgroup Administrators $env:RDP_USER /add 2>$null
+          net localgroup "Remote Desktop Users" $env:RDP_USER /add 2>$null
           
-          # Check if user exists
-          $userExists = net user $username 2>&1 | Select-String "The command completed successfully"
-          
-          if ($userExists) {
-            Write-Host "User $username already exists"
-          } else {
-            Write-Host "Creating user $username..."
-            net user $username $password /add /active:yes /expires:never
-            Write-Host "Created user: $username"
+          $profile = "C:\Users\$env:RDP_USER"
+          if (Test-Path $profile) {
+            icacls $profile /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
           }
           
-          # Add to all admin groups
-          net localgroup Administrators $username /add 2>$null
-          net localgroup "Remote Desktop Users" $username /add 2>$null
-          net localgroup "Users" $username /add 2>$null
-          
-          # Grant full permissions to user profile
-          $userProfile = "C:\Users\$username"
-          if (Test-Path $userProfile) {
-            icacls $userProfile /grant "${username}:(OI)(CI)F" /T /C /Q 2>$null
-          }
-          
-          # Grant full permissions to system directories
-          icacls "C:\ProgramData" /grant "${username}:(OI)(CI)F" /C /Q 2>$null
-          icacls "C:\Program Files" /grant "${username}:(OI)(CI)F" /C /Q 2>$null
-          icacls "C:\Program Files (x86)" /grant "${username}:(OI)(CI)F"  /C /Q 2>$null
-          
-          # Grant write access to Windows for full admin capabilities
-          icacls "C:\Windows" /grant "${username}:(OI)(CI)M"  /C /Q 2>$null
-          
-          Write-Host ""
-          Write-Host "============================================"
-          Write-Host "USER CREATED WITH FULL ADMIN ACCESS"
-          Write-Host "============================================"
-          Write-Host "Username: $username"
-          Write-Host "Password: $password"
-          Write-Host ""
-          Write-Host "Groups:"
-          net user $username | Select-String "Local Group"
-          Write-Host "============================================"
+          Write-Host "User: $env:RDP_USER | Pass: $env:RDP_PASS"
 
-      - name: Enable RDP with Optimizations
+      - name: Enable RDP
         shell: pwsh
         run: |
-          Write-Host "Enabling Remote Desktop with optimizations..."
-          
-          # Enable RDP via registry
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
-          
-          # Enable RDP firewall rule
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           
-          # Disable Network Level Authentication for better compatibility
           try {
             $ts = Get-WmiObject -class "Win32_TSGeneralSetting" -Namespace root\cimv2\terminalservices -Filter "TerminalName='RDP-Tcp'" -ErrorAction SilentlyContinue
             if ($ts) { $ts.SetUserAuthenticationRequired(0) }
           } catch {}
           
-          # Configure RDP for best performance
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0 -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0 -Force -ErrorAction SilentlyContinue
+          $rdp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $rdp -Name "UserAuthentication" -Value 0 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdp -Name "SecurityLayer" -Value 0 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdp -Name "fAutoReconnectEnabled" -Value 1 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdp -Name "ColorDepth" -Value 4 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdp -Name "BitmapPersistence" -Value 1 -ErrorAction SilentlyContinue
           
-          # Enable RDP auto-reconnect
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fInheritAutoReconnect" -Value 1 -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fAutoReconnectEnabled" -Value 1 -Force -ErrorAction SilentlyContinue
-          
-          # Increase RDP color depth (4 = 32-bit)
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fInheritColorDepth" -Value 0 -Force -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "ColorDepth" -Value 4 -Force -ErrorAction SilentlyContinue
-          
-          # Enable bitmap caching for smoother experience
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fInheritBitmapPersistence" -Value 0 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "BitmapPersistence" -Value 1 -ErrorAction SilentlyContinue
-          
-          # Optimize for multiple monitors
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "fInheritMaxMonitors" -Value 0 -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "MaxMonitors" -Value 4 -ErrorAction SilentlyContinue
-          
-          # Restart Terminal Services
           Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 3
-          
-          Write-Host "============================================"
-          Write-Host "Remote Desktop Enabled with Optimizations!"
-          Write-Host "Connect via RDP to: ${env:TAILSCALE_IP}:3389"
-          Write-Host "Username: ${env:RDP_USER}"
-          Write-Host "Password: ${env:RDP_PASS}"
-          Write-Host "============================================"
-
-      - name: Install Node.js + npm packages
-        shell: pwsh
-        run: |
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-          
-          node --version
-          npm --version
-          
-          npm install -g typescript ts-node nodemon pm2 yarn pnpm
-          
-          Write-Host "============================================"
-          Write-Host "Node.js Ready!"
-          Write-Host "============================================"
+          Write-Host "RDP enabled on port 3389"
 
       - name: Install Bonsai CLI
         shell: pwsh
@@ -509,201 +290,171 @@ jobs:
           BONSAI_API_KEY: ${{ inputs.bonsai_api_key }}
         run: |
           $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-          
-          npm install -g @bonsai-ai/cli 2>$null
+          npm install -g @bonsai-ai/cli
           
           if (-not [string]::IsNullOrEmpty($env:BONSAI_API_KEY)) {
-            $bonsaiDir = "$env:USERPROFILE\.bonsai"
-            New-Item -ItemType Directory -Path $bonsaiDir -Force | Out-Null
-            Set-Content -Path "$bonsaiDir\config" -Value "API_KEY=$env:BONSAI_API_KEY" -Encoding ascii
-            
-            $userBonsaiDir = "C:\Users\$env:RDP_USER\.bonsai"
-            New-Item -ItemType Directory -Path $userBonsaiDir -Force | Out-Null
-            Set-Content -Path "$userBonsaiDir\config" -Value "API_KEY=$env:BONSAI_API_KEY" -Encoding ascii
-            
-            Write-Host "Bonsai CLI configured with API key"
+            @("$env:USERPROFILE\.bonsai", "C:\Users\$env:RDP_USER\.bonsai") | ForEach-Object {
+              New-Item -ItemType Directory -Path $_ -Force | Out-Null
+              Set-Content -Path "$_\config" -Value "API_KEY=$env:BONSAI_API_KEY"
+            }
           }
-          
-          Write-Host "============================================"
-          Write-Host "Bonsai CLI Ready!"
-          Write-Host "============================================"
+          Write-Host "Bonsai CLI ready"
 
-      - name: Install VS Code (code-server) with Optimizations
+      - name: Install VS Code Server with GPU
         shell: pwsh
         run: |
+          $npmGlobal = "C:\npm-global"
+          $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+          
+          Write-Host "Installing code-server..."
+          npm install -g code-server
+          
+          # Verify
+          $cs = Get-Command code-server -ErrorAction SilentlyContinue
+          if (-not $cs) {
+            Write-Host "ERROR: code-server not found"
+            exit 1
+          }
+          Write-Host "code-server: $($cs.Source)"
+          
+          # Create directories
           $userProfile = "C:\Users\$env:RDP_USER"
-          
-          Write-Host "Installing code-server via npm..."
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-          npm install -g code-server 2>$null
-          
           $configDir = "$userProfile\.config\code-server"
           $dataDir = "$userProfile\.local\share\code-server"
-          New-Item -ItemType Directory -Path $configDir -Force | Out-Null
-          New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $configDir, "$dataDir\User", "$dataDir\extensions" -Force | Out-Null
           
-          # Create optimized config file for smoother experience
+          # Config file
           $configFile = "$configDir\config.yaml"
           Set-Content -Path $configFile -Value "bind-addr: 0.0.0.0:8080"
           Add-Content -Path $configFile -Value "auth: password"
           Add-Content -Path $configFile -Value "password: $env:RDP_PASS"
           Add-Content -Path $configFile -Value "cert: false"
-          Add-Content -Path $configFile -Value ""
-          Add-Content -Path $configFile -Value "# Performance optimizations"
           Add-Content -Path $configFile -Value "disable-getting-started-override: true"
           Add-Content -Path $configFile -Value "disable-telemetry: true"
           Add-Content -Path $configFile -Value "disable-update-check: true"
-          Add-Content -Path $configFile -Value ""
-          Add-Content -Path $configFile -Value "# Enable proxy for better connection"
-          Add-Content -Path $configFile -Value "proxy-domain: localhost"
-          Add-Content -Path $configFile -Value ""
-          Add-Content -Path $configFile -Value "# Extensions"
           Add-Content -Path $configFile -Value "extensions-dir: $dataDir/extensions"
           
-          # Create user settings for better performance
-          $userSettingsDir = "$dataDir\User"
-          New-Item -ItemType Directory -Path $userSettingsDir -Force | Out-Null
-          $settingsFile = "$userSettingsDir\settings.json"
-          
+          # GPU Settings
           $settings = @{
-            "editor.quickSuggestions" = @{
-              "other" = $true
-              "comments" = $false
-              "strings" = $false
-            }
+            "editor.quickSuggestions" = @{ "other" = "on"; "comments" = "off"; "strings" = "off" }
             "editor.suggestSelection" = "first"
-            "editor.wordBasedSuggestions" = "off"
+            "editor.wordBasedSuggestions" = "allDocuments"
             "editor.largeFileOptimizations" = $true
+            "editor.minimap.enabled" = $false
+            "editor.renderWhitespace" = "none"
+            "editor.folding" = $false
+            "editor.scrollBeyondLastLine" = $false
+            "editor.cursorBlinking" = "smooth"
+            "editor.cursorSmoothCaretAnimation" = "on"
+            "editor.smoothScrolling" = $true
+            "editor.fontLigatures" = $true
             "files.autoSave" = "afterDelay"
             "files.autoSaveDelay" = 1000
-            "terminal.integrated.gpuAcceleration" = "off"
+            "files.watcherExclude" = @{ "**/.git/**" = $true; "**/node_modules/**" = $true }
+            "search.exclude" = @{ "**/node_modules" = $true; "**/.git" = $true }
+            "terminal.integrated.gpuAcceleration" = "on"
+            "terminal.integrated.smoothScrolling" = $true
             "workbench.enableExperiments" = $false
-            "workbench.settings.enableNaturalLanguageSearch" = $false
+            "workbench.startupEditor" = "none"
+            "workbench.tips.enabled" = $false
+            "workbench.list.smoothScrolling" = $true
             "telemetry.telemetryLevel" = "off"
             "update.mode" = "none"
             "extensions.autoUpdate" = $false
-            "extensions.autoCheckUpdates" = $false
-          }
+            "typescript.tsserver.maxTsServerMemory" = 4096
+          } | ConvertTo-Json -Depth 10 | Set-Content -Path "$dataDir\User\settings.json" -Encoding UTF8
           
-          $settings | ConvertTo-Json -Depth 10 | Set-Content -Path $settingsFile -Encoding UTF8
+          # Permissions
+          icacls $configDir /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
+          icacls $dataDir /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
+          icacls $npmGlobal /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
           
-          # Set ownership
-          icacls $configDir /grant "${env:RDP_USER}:(OI)(CI)F" /T /C /Q 2>$null
-          icacls $dataDir /grant "${env:RDP_USER}:(OI)(CI)F" /T /C /Q 2>$null
-          
-          Write-Host "============================================"
-          Write-Host "VS Code (code-server) Ready for $env:RDP_USER!"
-          Write-Host "Access at: http://localhost:8080"
-          Write-Host "Password: $env:RDP_PASS"
-          Write-Host "Optimizations: GPU off, Telemetry off"
-          Write-Host "============================================"
+          Write-Host "VS Code Server ready with GPU acceleration"
 
       - name: Start Services
         shell: pwsh
         run: |
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+          $npmGlobal = "C:\npm-global"
+          $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           
-          # Start code-server with optimized settings
-          $codeServerArgs = @(
-            "--config", "C:\Users\$env:RDP_USER\.config\code-server\config.yaml",
-            "--user-data-dir", "C:\Users\$env:RDP_USER\.local\share\code-server",
+          Write-Host "Starting code-server..."
+          Start-Process -FilePath "code-server" -ArgumentList @(
+            "--bind-addr", "0.0.0.0:8080",
+            "--auth", "password",
+            "--cert", "false",
             "--disable-telemetry",
-            "--disable-update-check"
-          )
+            "--disable-update-check",
+            "--disable-workspace-trust",
+            "--user-data-dir", "C:\Users\$env:RDP_USER\.local\share\code-server"
+          ) -ErrorAction SilentlyContinue
           
-          Start-Process -FilePath "code-server" -ArgumentList $codeServerArgs -WindowStyle Hidden -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 5
           
-          Start-Sleep -Seconds 3
-          
-          # Verify code-server is running
-          $codeServerProcess = Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*code-server*" }
-          if ($codeServerProcess) {
-            Write-Host "code-server started successfully (PID: $($codeServerProcess.Id))"
-          } else {
-            Write-Host "Warning: code-server may not have started properly"
-          }
+          # Check port
+          $port = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
+          $portStatus = if ($port) { "LISTENING" } else { "NOT READY" }
           
           Write-Host ""
           Write-Host "============================================"
-          Write-Host "ALL SERVICES STARTED!"
+          Write-Host "ALL SERVICES STARTED"
           Write-Host "============================================"
-          Write-Host ""
-          Write-Host "CONNECTION INFO:"
-          Write-Host "  RDP: ${env:TAILSCALE_IP}:3389"
-          Write-Host "  VS Code: http://${env:TAILSCALE_IP}:8080"
-          Write-Host ""
-          Write-Host "CREDENTIALS:"
-          Write-Host "  Username: $env:RDP_USER"
-          Write-Host "  Password: $env:RDP_PASS"
-          Write-Host ""
-          Write-Host "PERFORMANCE MODE: HIGH"
-          Write-Host "  - RDP auto-reconnect enabled"
-          Write-Host "  - Bitmap caching enabled"
-          Write-Host "  - Network throttling disabled"
-          Write-Host "  - CPU at max performance"
-          Write-Host "  - Core parking disabled"
+          Write-Host "RDP:          ${env:TAILSCALE_IP}:3389"
+          Write-Host "VS Code:      http://${env:TAILSCALE_IP}:8080"
+          Write-Host "Port 8080:    $portStatus"
+          Write-Host "Username:     $env:RDP_USER"
+          Write-Host "Password:     $env:RDP_PASS"
+          Write-Host "GPU:          ENABLED"
           Write-Host "============================================"
 
-      - name: Keep alive
+      - name: Keep Alive
         shell: pwsh
         run: |
-          $runtimeMinutes = 355
-          try { $runtimeMinutes = [int]$env:RUNTIME_MINUTES } catch { $runtimeMinutes = 355 }
-          if ($runtimeMinutes -lt 1) { $runtimeMinutes = 355 }
+          $runtime = 355
+          try { $runtime = [int]$env:RUNTIME_MINUTES } catch {}
+          if ($runtime -lt 1) { $runtime = 355 }
           
-          $endTime = (Get-Date).AddMinutes($runtimeMinutes)
-          $iteration = 0
-          
-          Write-Host "Keep-alive started. Will run for $runtimeMinutes minutes"
+          $endTime = (Get-Date).AddMinutes($runtime)
+          $i = 0
           
           while ((Get-Date) -lt $endTime) {
-            $iteration++
-            $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes)
-            $timestamp = Get-Date -Format "HH:mm:ss"
+            $i++
+            $rem = [math]::Round(($endTime - (Get-Date)).TotalMinutes)
+            $time = Get-Date -Format "HH:mm:ss"
             
-            # Keep system active with ScrollLock toggle
+            # Keep awake
             try {
-              $wshell = New-Object -ComObject WScript.Shell -ErrorAction SilentlyContinue
-              if ($wshell) {
-                $wshell.SendKeys("{SCROLLLOCK}")
-                $wshell.SendKeys("{SCROLLLOCK}")
-              }
+              $w = New-Object -ComObject WScript.Shell -ErrorAction SilentlyContinue
+              $w.SendKeys("{SCROLLLOCK}")
+              $w.SendKeys("{SCROLLLOCK}")
             } catch {}
             
-            # Check services with null-safe handling
-            $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-            $rdpStatus = if ($rdpService) { $rdpService.Status } else { "Unknown" }
+            $rdp = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            $node = Get-Process -Name node -ErrorAction SilentlyContinue
+            $port = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
             
-            $codeServer = Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*code-server*" }
-            $codeServerStatus = if ($codeServer) { "Running ($($codeServer.Count))" } else { "Stopped" }
+            $rdpS = if ($rdp) { $rdp.Status } else { "Unknown" }
+            $csS = if ($node) { "Running" } else { "Stopped" }
+            $portS = if ($port) { "OK" } else { "DOWN" }
             
-            Write-Host "[$iteration] Alive at $timestamp | RDP: $env:RDP_USER @ $env:TAILSCALE_IP | Remaining: $remaining min | Services: RDP($rdpStatus) code-server($codeServerStatus)"
+            Write-Host "[$i] $time | ${rem}min left | RDP: $rdpS | VSCode: $csS | Port: $portS | IP: $env:TAILSCALE_IP"
             Start-Sleep -Seconds 60
           }
-          
-          Write-Host "Runtime completed at $(Get-Date)"
+          Write-Host "Done at $(Get-Date)"
 
-      - name: Cleanup on exit
+      - name: Cleanup
         if: always()
         shell: pwsh
         run: |
-          Write-Host "Cleaning up..."
+          $ts = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          if (Test-Path $ts) { & $ts logout 2>$null }
           
-          # Logout from Tailscale
-          $tailscalePath = "${env:ProgramFiles}\Tailscale\tailscale.exe"
-          if (Test-Path $tailscalePath) {
-            & $tailscalePath logout 2>$null
-            Write-Host "Logged out from Tailscale"
-          }
+          Stop-Process -Name node -Force -ErrorAction SilentlyContinue
           
-          # Stop code-server
-          Stop-Process -Name "node" -Force -ErrorAction SilentlyContinue
-          
-          # Disable RDP
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 1 -ErrorAction SilentlyContinue
           Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "code-server" -ErrorAction SilentlyContinue
           
-          # Restore power settings to Balanced
           powercfg -setactive 381b4222-f694-41f0-9685-ff5bb260df2e 2>$null
           
-          Write-Host "Cleanup completed"
+          Write-Host "Cleanup done"
+
