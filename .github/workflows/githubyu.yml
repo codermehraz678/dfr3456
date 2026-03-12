@@ -195,11 +195,11 @@ jobs:
           choco install -y git wget vim nano 7zip --no-progress
           Write-Host "Base packages installed"
 
-      - name: Install Node.js Latest + npm Latest
+      - name: Install Node.js 20 LTS + npm Latest
         shell: pwsh
         run: |
-          # Install latest Node.js via winget
-          winget install OpenJS.NodeJS.LTS --accept-source-agreements --accept-package-agreements
+          # Install Node.js 20 LTS (stable for native modules)
+          choco install -y nodejs-lts --version=20.18.0 --no-progress
           
           # Set up npm global path
           $npmGlobal = "C:\npm-global"
@@ -300,14 +300,14 @@ jobs:
           }
           Write-Host "Bonsai CLI ready"
 
-      - name: Install VS Code Server with GPU
+      - name: Install VS Code Server
         shell: pwsh
         run: |
           $npmGlobal = "C:\npm-global"
           $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           
           Write-Host "Installing code-server..."
-          npm install -g code-server
+          npm install -g code-server --ignore-scripts
           
           # Verify
           $cs = Get-Command code-server -ErrorAction SilentlyContinue
@@ -334,7 +334,7 @@ jobs:
           Add-Content -Path $configFile -Value "disable-update-check: true"
           Add-Content -Path $configFile -Value "extensions-dir: $dataDir/extensions"
           
-          # GPU Settings
+          # Settings
           $settings = @{
             "editor.quickSuggestions" = @{ "other" = "on"; "comments" = "off"; "strings" = "off" }
             "editor.suggestSelection" = "first"
@@ -344,20 +344,14 @@ jobs:
             "editor.renderWhitespace" = "none"
             "editor.folding" = $false
             "editor.scrollBeyondLastLine" = $false
-            "editor.cursorBlinking" = "smooth"
-            "editor.cursorSmoothCaretAnimation" = "on"
-            "editor.smoothScrolling" = $true
-            "editor.fontLigatures" = $true
             "files.autoSave" = "afterDelay"
             "files.autoSaveDelay" = 1000
             "files.watcherExclude" = @{ "**/.git/**" = $true; "**/node_modules/**" = $true }
             "search.exclude" = @{ "**/node_modules" = $true; "**/.git" = $true }
-            "terminal.integrated.gpuAcceleration" = "on"
-            "terminal.integrated.smoothScrolling" = $true
+            "terminal.integrated.gpuAcceleration" = "off"
             "workbench.enableExperiments" = $false
             "workbench.startupEditor" = "none"
             "workbench.tips.enabled" = $false
-            "workbench.list.smoothScrolling" = $true
             "telemetry.telemetryLevel" = "off"
             "update.mode" = "none"
             "extensions.autoUpdate" = $false
@@ -369,7 +363,7 @@ jobs:
           icacls $dataDir /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
           icacls $npmGlobal /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
           
-          Write-Host "VS Code Server ready with GPU acceleration"
+          Write-Host "VS Code Server ready"
 
       - name: Start Services
         shell: pwsh
@@ -403,7 +397,6 @@ jobs:
           Write-Host "Port 8080:    $portStatus"
           Write-Host "Username:     $env:RDP_USER"
           Write-Host "Password:     $env:RDP_PASS"
-          Write-Host "GPU:          ENABLED"
           Write-Host "============================================"
 
       - name: Keep Alive
@@ -457,4 +450,3 @@ jobs:
           powercfg -setactive 381b4222-f694-41f0-9685-ff5bb260df2e 2>$null
           
           Write-Host "Cleanup done"
-
