@@ -195,26 +195,27 @@ jobs:
           choco install -y git wget vim nano 7zip --no-progress
           Write-Host "Base packages installed"
 
-      - name: Install Node.js 20 LTS + npm Latest
+      - name: Setup Node.js and npm
         shell: pwsh
         run: |
-          # Install Node.js 20 LTS (stable for native modules)
-          choco install -y nodejs-lts --version=20.18.0 --no-progress
+          # Use pre-installed Node.js on windows-latest runner
+          Write-Host "Using pre-installed Node.js..."
+          node --version
+          npm --version
           
           # Set up npm global path
           $npmGlobal = "C:\npm-global"
           New-Item -ItemType Directory -Path $npmGlobal -Force | Out-Null
           
-          # Refresh PATH
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-          
           # Update npm to latest version
           Write-Host "Updating npm to latest version..."
           npm install -g npm@latest
           
-          # Configure npm
+          # Configure npm global prefix
           npm config set prefix $npmGlobal
-          $env:PATH = "$npmGlobal;" + $env:PATH
+          
+          # Refresh PATH with new npm global
+          $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           Add-Content -Path $env:GITHUB_PATH -Value $npmGlobal
           
           # Install global packages
@@ -223,13 +224,15 @@ jobs:
           Write-Host "Node: $(node --version)"
           Write-Host "npm: $(npm --version)"
 
-      - name: Install Claude CLI
+      - name: Install Claude CLI with Bonsai Support
         shell: pwsh
         env:
           CLAUDE_API_KEY: ${{ inputs.claude_api_key }}
+          BONSAI_API_KEY: ${{ inputs.bonsai_api_key }}
         run: |
           $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           
+          # Install Claude CLI
           $result = winget install --id Anthropic.Claude --accept-source-agreements --accept-package-agreements 2>&1
           if ($LASTEXITCODE -ne 0) {
             $url = "https://github.com/anthropics/claude-cli/releases/latest/download/claude-windows-x64.exe"
@@ -240,12 +243,51 @@ jobs:
             Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $dest)
           }
           
-          if (-not [string]::IsNullOrEmpty($env:CLAUDE_API_KEY)) {
-            @("$env:USERPROFILE\.claude", "C:\Users\$env:RDP_USER\.claude") | ForEach-Object {
-              New-Item -ItemType Directory -Path $_ -Force | Out-Null
-              Set-Content -Path "$_\config.json" -Value "{`"api_key`": `"$env:CLAUDE_API_KEY`"}"
+          # Determine which API key to use
+          $apiKey = $env:CLAUDE_API_KEY
+          $baseUrl = $null
+          
+          # If Bonsai API key is provided, use Bonsai endpoint
+          if (-not [string]::IsNullOrEmpty($env:BONSAI_API_KEY)) {
+            $apiKey = $env:BONSAI_API_KEY
+            $baseUrl = "https://api.bonsai.ai/v1"
+            Write-Host "Using Bonsai API endpoint"
+          } elseif (-not [string]::IsNullOrEmpty($env:CLAUDE_API_KEY)) {
+            Write-Host "Using Anthropic API endpoint"
+          }
+          
+          # Configure Claude CLI for both runner and RDP user
+          if (-not [string]::IsNullOrEmpty($apiKey)) {
+            $configDirs = @("$env:USERPROFILE\.claude", "C:\Users\$env:RDP_USER\.claude")
+            
+            foreach ($dir in $configDirs) {
+              New-Item -ItemType Directory -Path $dir -Force | Out-Null
+              
+              # Create config with API key and base URL
+              $config = @{
+                "api_key" = $apiKey
+              }
+              if ($baseUrl) {
+                $config["base_url"] = $baseUrl
+              }
+              
+              $config | ConvertTo-Json -Depth 10 | Set-Content -Path "$dir\config.json" -Encoding UTF8
+              
+              # Also create .env file for claude
+              $envContent = "ANTHROPIC_API_KEY=$apiKey"
+              if ($baseUrl) {
+                $envContent += "`nANTHROPIC_BASE_URL=$baseUrl"
+              }
+              Set-Content -Path "$dir\.env" -Value $envContent -Encoding UTF8
             }
-            [Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", $env:CLAUDE_API_KEY, "User")
+            
+            # Set environment variables
+            [Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", $apiKey, "User")
+            if ($baseUrl) {
+              [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $baseUrl, "User")
+            }
+            
+            Write-Host "Claude CLI configured with API key"
           }
           Write-Host "Claude CLI ready"
 
@@ -284,38 +326,37 @@ jobs:
           Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
           Write-Host "RDP enabled on port 3389"
 
-      - name: Install Bonsai CLI
-        shell: pwsh
-        env:
-          BONSAI_API_KEY: ${{ inputs.bonsai_api_key }}
-        run: |
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-          npm install -g @bonsai-ai/cli
-          
-          if (-not [string]::IsNullOrEmpty($env:BONSAI_API_KEY)) {
-            @("$env:USERPROFILE\.bonsai", "C:\Users\$env:RDP_USER\.bonsai") | ForEach-Object {
-              New-Item -ItemType Directory -Path $_ -Force | Out-Null
-              Set-Content -Path "$_\config" -Value "API_KEY=$env:BONSAI_API_KEY"
-            }
-          }
-          Write-Host "Bonsai CLI ready"
-
       - name: Install VS Code Server
         shell: pwsh
         run: |
           $npmGlobal = "C:\npm-global"
+          New-Item -ItemType Directory -Path $npmGlobal -Force | Out-Null
+          
+          # Set npm prefix BEFORE installing
+          npm config set prefix $npmGlobal
+          
+          # Set PATH
           $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           
+          Write-Host "npm prefix: $npmGlobal"
           Write-Host "Installing code-server..."
           npm install -g code-server --ignore-scripts
           
-          # Verify
-          $cs = Get-Command code-server -ErrorAction SilentlyContinue
-          if (-not $cs) {
-            Write-Host "ERROR: code-server not found"
-            exit 1
+          # Verify installation
+          Write-Host "Checking installation..."
+          $csCmd = Join-Path $npmGlobal "code-server.cmd"
+          $csPs1 = Join-Path $npmGlobal "code-server.ps1"
+          
+          if (Test-Path $csCmd) {
+            Write-Host "Found: $csCmd"
+          } elseif (Test-Path $csPs1) {
+            Write-Host "Found: $csPs1"
+          } else {
+            Write-Host "Checking npm global packages..."
+            npm list -g --depth=0
+            Write-Host "Files in $npmGlobal:"
+            Get-ChildItem $npmGlobal -ErrorAction SilentlyContinue | Select-Object Name
           }
-          Write-Host "code-server: $($cs.Source)"
           
           # Create directories
           $userProfile = "C:\Users\$env:RDP_USER"
@@ -371,22 +412,60 @@ jobs:
           $npmGlobal = "C:\npm-global"
           $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           
-          Write-Host "Starting code-server..."
-          Start-Process -FilePath "code-server" -ArgumentList @(
-            "--bind-addr", "0.0.0.0:8080",
-            "--auth", "password",
-            "--cert", "false",
-            "--disable-telemetry",
-            "--disable-update-check",
-            "--disable-workspace-trust",
-            "--user-data-dir", "C:\Users\$env:RDP_USER\.local\share\code-server"
-          ) -ErrorAction SilentlyContinue
+          Write-Host "PATH: $env:PATH"
           
-          Start-Sleep -Seconds 5
+          # Find code-server
+          $codeServerPath = Get-Command code-server -ErrorAction SilentlyContinue
+          if (-not $codeServerPath) {
+            Write-Host "Searching for code-server..."
+            $possiblePaths = @(
+              "$npmGlobal\code-server.cmd",
+              "$npmGlobal\code-server.ps1",
+              "C:\Program Files\nodejs\code-server.cmd",
+              "${env:ProgramFiles}\nodejs\code-server.cmd"
+            )
+            foreach ($p in $possiblePaths) {
+              if (Test-Path $p) {
+                $codeServerPath = $p
+                Write-Host "Found: $p"
+                break
+              }
+            }
+          } else {
+            $codeServerPath = $codeServerPath.Source
+          }
+          
+          if (-not $codeServerPath) {
+            Write-Host "ERROR: code-server not found!"
+            Write-Host "Checking npm global packages..."
+            npm list -g --depth=0
+          } else {
+            Write-Host "Starting code-server from: $codeServerPath"
+            
+            $dataDir = "C:\Users\$env:RDP_USER\.local\share\code-server"
+            
+            # Start code-server with full path
+            Start-Process -FilePath "cmd.exe" -ArgumentList @(
+              "/c", $codeServerPath,
+              "--bind-addr", "0.0.0.0:8080",
+              "--auth", "password",
+              "--cert", "false",
+              "--disable-telemetry",
+              "--disable-update-check",
+              "--disable-workspace-trust",
+              "--user-data-dir", $dataDir
+            ) -WindowStyle Hidden -ErrorAction SilentlyContinue
+            
+            Start-Sleep -Seconds 8
+          }
           
           # Check port
           $port = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
           $portStatus = if ($port) { "LISTENING" } else { "NOT READY" }
+          
+          # Check node process
+          $nodeProcess = Get-Process -Name node -ErrorAction SilentlyContinue
+          $nodeStatus = if ($nodeProcess) { "Running (PID: $($nodeProcess.Id -join ', '))" } else { "Not running" }
           
           Write-Host ""
           Write-Host "============================================"
@@ -395,6 +474,7 @@ jobs:
           Write-Host "RDP:          ${env:TAILSCALE_IP}:3389"
           Write-Host "VS Code:      http://${env:TAILSCALE_IP}:8080"
           Write-Host "Port 8080:    $portStatus"
+          Write-Host "Node:         $nodeStatus"
           Write-Host "Username:     $env:RDP_USER"
           Write-Host "Password:     $env:RDP_PASS"
           Write-Host "============================================"
@@ -450,3 +530,4 @@ jobs:
           powercfg -setactive 381b4222-f694-41f0-9685-ff5bb260df2e 2>$null
           
           Write-Host "Cleanup done"
+          Write-host "mehraz created this code via his own coding skills"
