@@ -230,29 +230,26 @@ jobs:
           CLAUDE_API_KEY: ${{ inputs.claude_api_key }}
           BONSAI_API_KEY: ${{ inputs.bonsai_api_key }}
         run: |
+          # Refresh PATH
           $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           
-          # Uninstall any existing version first
-          winget uninstall --id Anthropic.Claude --silent 2>$null
+          # Download latest Claude CLI directly from GitHub (avoids winget interactive prompts)
+          Write-Host "Downloading latest Claude CLI from GitHub..."
+          $url = "https://github.com/anthropics/claude-cli/releases/latest/download/claude-windows-x64.exe"
+          $claudeDir = "${env:ProgramFiles}\Claude"
+          $claudeExe = "$claudeDir\claude.exe"
           
-          # Install Claude CLI latest version
-          Write-Host "Installing latest Claude CLI..."
-          $result = winget install --id Anthropic.Claude --accept-source-agreements --accept-package-agreements 2>&1
+          New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $claudeExe -UseBasicParsing
           
-          # If winget fails, download latest directly from GitHub
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "Winget failed, downloading latest from GitHub..."
-            $url = "https://github.com/anthropics/claude-cli/releases/latest/download/claude-windows-x64.exe"
-            $dest = "${env:ProgramFiles}\Claude\claude.exe"
-            New-Item -ItemType Directory -Path (Split-Path $dest) -Force | Out-Null
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
-            Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $dest)
-          }
+          # Add to PATH
+          Add-Content -Path $env:GITHUB_PATH -Value $claudeDir
+          $env:PATH = "$claudeDir;" + $env:PATH
           
-          # Verify version
-          Write-Host "Claude CLI version:"
-          claude --version 2>$null
+          # Verify installation
+          Write-Host "Claude CLI installed:"
+          & $claudeExe --version
           
           # Determine which API key to use
           $apiKey = $env:CLAUDE_API_KEY
