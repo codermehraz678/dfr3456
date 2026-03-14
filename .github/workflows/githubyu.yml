@@ -224,23 +224,32 @@ jobs:
           Write-Host "Node: $(node --version)"
           Write-Host "npm: $(npm --version)"
 
-      - name: Install Claude Code Latest with Bonsai Support
+      - name: Install Claude CLI Latest with Bonsai Support
         shell: pwsh
         env:
           CLAUDE_API_KEY: ${{ inputs.claude_api_key }}
           BONSAI_API_KEY: ${{ inputs.bonsai_api_key }}
         run: |
           # Refresh PATH
-          $npmGlobal = "C:\npm-global"
-          $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
           
-          # Install Claude Code via npm (latest version)
-          Write-Host "Installing latest Claude Code via npm..."
-          npm install -g @anthropic-ai/claude-code
+          # Download latest Claude CLI directly from GitHub (avoids winget interactive prompts)
+          Write-Host "Downloading latest Claude CLI from GitHub..."
+          $url = "https://github.com/anthropics/claude-cli/releases/latest/download/claude-windows-x64.exe"
+          $claudeDir = "${env:ProgramFiles}\Claude"
+          $claudeExe = "$claudeDir\claude.exe"
+          
+          New-Item -ItemType Directory -Path $claudeDir -Force | Out-Null
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $claudeExe -UseBasicParsing
+          
+          # Add to PATH
+          Add-Content -Path $env:GITHUB_PATH -Value $claudeDir
+          $env:PATH = "$claudeDir;" + $env:PATH
           
           # Verify installation
-          Write-Host "Claude Code installed:"
-          claude --version
+          Write-Host "Claude CLI installed:"
+          & $claudeExe --version
           
           # Determine which API key to use
           $apiKey = $env:CLAUDE_API_KEY
@@ -255,17 +264,29 @@ jobs:
             Write-Host "Using Anthropic API endpoint"
           }
           
-          # Configure Claude for both runner and RDP user
+          # Configure Claude CLI for both runner and RDP user
           if (-not [string]::IsNullOrEmpty($apiKey)) {
             $configDirs = @("$env:USERPROFILE\.claude", "C:\Users\$env:RDP_USER\.claude")
             
             foreach ($dir in $configDirs) {
               New-Item -ItemType Directory -Path $dir -Force | Out-Null
               
-              # Create config with API key
-              $config = @{ "api_key" = $apiKey }
-              if ($baseUrl) { $config["base_url"] = $baseUrl }
-              $config | ConvertTo-Json | Set-Content -Path "$dir\config.json" -Encoding UTF8
+              # Create config with API key and base URL
+              $config = @{
+                "api_key" = $apiKey
+              }
+              if ($baseUrl) {
+                $config["base_url"] = $baseUrl
+              }
+              
+              $config | ConvertTo-Json -Depth 10 | Set-Content -Path "$dir\config.json" -Encoding UTF8
+              
+              # Also create .env file for claude
+              $envContent = "ANTHROPIC_API_KEY=$apiKey"
+              if ($baseUrl) {
+                $envContent += "`nANTHROPIC_BASE_URL=$baseUrl"
+              }
+              Set-Content -Path "$dir\.env" -Value $envContent -Encoding UTF8
             }
             
             # Set environment variables
@@ -273,9 +294,10 @@ jobs:
             if ($baseUrl) {
               [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $baseUrl, "User")
             }
-            Write-Host "Claude CLI configured"
+            
+            Write-Host "Claude CLI configured with API key"
           }
-          Write-Host "Claude Code ready"
+          Write-Host "Claude CLI ready"
 
       - name: Create Admin User
         shell: pwsh
@@ -516,4 +538,3 @@ jobs:
           powercfg -setactive 381b4222-f694-41f0-9685-ff5bb260df2e 2>$null
           
           Write-Host "Cleanup done"
-
