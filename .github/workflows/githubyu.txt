@@ -1,0 +1,563 @@
+name: RDP + Tailscale + Dev Environment (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: "Hostname for this RDP instance"
+        required: true
+        default: "bullet"
+      ts_tailnet:
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key"
+        required: true
+      ts_authkey:
+        description: "Tailscale Auth key"
+        required: true
+      quick_test:
+        description: "Run 5-minute test"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Runtime (max 360)"
+        default: "355"
+      do_purge:
+        description: "Purge old devices"
+        default: "true"
+      rdp_count:
+        description: "RDP instances (1-10)"
+        default: "1"
+      rdp_username:
+        description: "RDP Username"
+        default: "bulletuser"
+      rdp_password:
+        description: "RDP Password"
+        default: "Bullet@12345"
+      bonsai_api_key:
+        description: "Bonsai API Key"
+        required: false
+        default: ""
+      claude_api_key:
+        description: "Claude API Key"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - name: Generate matrix
+        id: mk
+        shell: bash
+        run: |
+          n=${{ inputs.rdp_count }}
+          [ "$n" -lt 1 ] && n=1
+          [ "$n" -gt 10 ] && n=10
+          include="["
+          for i in $(seq 1 $n); do
+            [ $i -gt 1 ] && include+=","
+            include+="{\"id\": $i}"
+          done
+          include+="]"
+          echo "matrix={\"include\":$include}" >> $GITHUB_OUTPUT
+
+  purge-devices:
+    runs-on: ubuntu-latest
+    needs: setup
+    if: ${{ inputs.do_purge == 'true' }}
+    steps:
+      - name: Purge old devices
+        env:
+          TS_TAILNET: ${{ inputs.ts_tailnet }}
+          TS_API_KEY: ${{ inputs.ts_api_key }}
+          HOSTNAME_INPUT: ${{ inputs.hostname }}
+        shell: bash
+        run: |
+          pattern="${HOSTNAME_INPUT:-bullet}"
+          devices=$(curl -s -H "Authorization: Bearer $TS_API_KEY" "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices")
+          echo "$devices" | jq -r ".devices[] | select(.hostname | contains(\"$pattern\")) | .id" | while read id; do
+            [ -n "$id" ] && curl -s -X DELETE -H "Authorization: Bearer $TS_API_KEY" "https://api.tailscale.com/api/v2/device/$id"
+          done
+
+  rdp:
+    needs: [setup, purge-devices]
+    if: always() && needs.setup.result == 'success'
+    runs-on: windows-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 10
+      fail-fast: false
+    timeout-minutes: 370
+
+    env:
+      RDP_USER: ${{ inputs.rdp_username }}
+      RDP_PASS: ${{ inputs.rdp_password }}
+
+    steps:
+      - name: Set hostname and runtime
+        shell: pwsh
+        run: |
+          $hostname = "${{ inputs.hostname }}"
+          if ([string]::IsNullOrEmpty($hostname)) {
+            $hostname = if ([int]"${{ inputs.rdp_count }}" -gt 1) { "bullet${{ matrix.id }}" } else { "bullet" }
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "TS_HOSTNAME=$hostname"
+          
+          $runtime = 355
+          try { $runtime = [int]"${{ inputs.runtime_minutes }}" } catch {}
+          if ("${{ inputs.quick_test }}" -eq "true") { $runtime = 5 }
+          if ($runtime -lt 1 -or $runtime -gt 360) { $runtime = 355 }
+          Add-Content -Path $env:GITHUB_ENV -Value "RUNTIME_MINUTES=$runtime"
+          
+          Write-Host "Hostname: $hostname | Runtime: $runtime min"
+
+      - name: Enable High Performance Mode
+        shell: pwsh
+        run: |
+          Write-Host "Enabling High Performance Mode..."
+          
+          # Activate High Performance (standard GUID)
+          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          
+          # Try Ultimate Performance
+          $result = powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>&1
+          if ($result -match "([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})") {
+            powercfg -setactive $matches[1]
+            Write-Host "Ultimate Performance activated"
+          }
+          
+          # Disable sleep/hibernate
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -standby-timeout-ac 0
+          powercfg -change -hibernate-timeout-ac 0
+          powercfg -hibernate off
+          
+          # Disable visual effects
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop\WindowMetrics" -Name "MinAnimate" -Value "0" -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 2 -ErrorAction SilentlyContinue
+          
+          # Network optimizations
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" -Name "NetworkThrottlingIndex" -Value 0xffffffff -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" -Name "SystemResponsiveness" -Value 0 -ErrorAction SilentlyContinue
+          
+          # Stop unnecessary services
+          Stop-Service -Name "SysMain" -Force -ErrorAction SilentlyContinue
+          Stop-Service -Name "DiagTrack" -Force -ErrorAction SilentlyContinue
+          
+          # Open firewall for code-server
+          New-NetFirewallRule -DisplayName "code-server" -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
+          
+          Write-Host "High Performance Mode ENABLED"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $installer = "$env:TEMP\tailscale.exe"
+          
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+          Start-Process -FilePath $installer -ArgumentList "/quiet", "/noreboot" -Wait -NoNewWindow
+          
+          $tsPath = "${env:ProgramFiles}\Tailscale"
+          Add-Content -Path $env:GITHUB_PATH -Value $tsPath
+          $env:PATH += ";$tsPath"
+          
+          & "$tsPath\tailscale.exe" version
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ inputs.ts_authkey }}
+        run: |
+          $tsPath = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          Start-Sleep -Seconds 3
+          
+          & $tsPath up --authkey="$env:TS_AUTHKEY" --hostname="$env:TS_HOSTNAME" --accept-dns --accept-routes
+          Start-Sleep -Seconds 5
+          
+          $ip = (& $tsPath ip -4 2>$null)
+          if ([string]::IsNullOrEmpty($ip)) { $ip = "unknown" }
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$ip"
+          Write-Host "Tailscale IP: $ip"
+
+      - name: Install Chocolatey Packages
+        shell: pwsh
+        run: |
+          choco install -y git wget vim nano 7zip --no-progress
+          Write-Host "Base packages installed"
+
+      - name: Setup Node.js and npm
+        shell: pwsh
+        run: |
+          # Use pre-installed Node.js on windows-latest runner
+          Write-Host "Using pre-installed Node.js..."
+          node --version
+          npm --version
+          
+          # Set up npm global path
+          $npmGlobal = "C:\npm-global"
+          New-Item -ItemType Directory -Path $npmGlobal -Force | Out-Null
+          
+          # Update npm to latest version
+          Write-Host "Updating npm to latest version..."
+          npm install -g npm@latest
+          
+          # Configure npm global prefix
+          npm config set prefix $npmGlobal
+          
+          # Refresh PATH with new npm global
+          $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+          Add-Content -Path $env:GITHUB_PATH -Value $npmGlobal
+          
+          # Install global packages
+          npm install -g typescript ts-node nodemon pm2 yarn pnpm
+          
+          Write-Host "Node: $(node --version)"
+          Write-Host "npm: $(npm --version)"
+
+      - name: Install Claude Code Latest with Bonsai Support
+        shell: pwsh
+        env:
+          CLAUDE_API_KEY: ${{ inputs.claude_api_key }}
+          BONSAI_API_KEY: ${{ inputs.bonsai_api_key }}
+        run: |
+          # Refresh PATH
+          $npmGlobal = "C:\npm-global"
+          $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+
+          # Install Claude Code via npm (latest version)
+          Write-Host "Installing latest Claude Code via npm..."
+          npm install -g @anthropic-ai/claude-code
+
+          # Verify installation
+          Write-Host "Claude Code installed:"
+          claude --version
+
+          # Determine which API key to use
+          $apiKey = $env:CLAUDE_API_KEY
+          $baseUrl = $null
+
+          # If Bonsai API key is provided, use Bonsai endpoint
+          if (-not [string]::IsNullOrEmpty($env:BONSAI_API_KEY)) {
+            $apiKey = $env:BONSAI_API_KEY
+            $baseUrl = "https://api.bonsai.ai/v1"
+            Write-Host "Using Bonsai API endpoint"
+          } elseif (-not [string]::IsNullOrEmpty($env:CLAUDE_API_KEY)) {
+            Write-Host "Using Anthropic API endpoint"
+          }
+
+          # Configure Claude for both runner and RDP user (skip login)
+          if (-not [string]::IsNullOrEmpty($apiKey)) {
+            $configDirs = @("$env:USERPROFILE\.claude", "C:\Users\$env:RDP_USER\.claude")
+
+            foreach ($dir in $configDirs) {
+              New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+              # Create config with API key and settings to skip login
+              $config = @{
+                "api_key" = $apiKey
+                "hasAcceptedTerms" = $true
+                "hasCompletedOnboarding" = $true
+              }
+              if ($baseUrl) {
+                $config["base_url"] = $baseUrl
+                $config["apiBaseUrl"] = $baseUrl
+              }
+              $config | ConvertTo-Json -Depth 10 | Set-Content -Path "$dir\config.json" -Encoding UTF8
+
+              # Create settings.json to skip onboarding
+              $settings = @{
+                "hasAcceptedTerms" = $true
+                "hasCompletedOnboarding" = $true
+                "telemetryEnabled" = $false
+              }
+              $settings | ConvertTo-Json | Set-Content -Path "$dir\settings.json" -Encoding UTF8
+
+              # Create credentials file
+              $credentials = @{ "anthropic" = @{ "api_key" = $apiKey } }
+              if ($baseUrl) {
+                $credentials["anthropic"]["base_url"] = $baseUrl
+              }
+              $credentials | ConvertTo-Json -Depth 10 | Set-Content -Path "$dir\credentials.json" -Encoding UTF8
+            }
+
+            # Set environment variables for both Machine and User
+            [Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", $apiKey, "Machine")
+            [Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", $apiKey, "User")
+            [Environment]::SetEnvironmentVariable("CLAUDE_API_KEY", $apiKey, "Machine")
+            [Environment]::SetEnvironmentVariable("CLAUDE_API_KEY", $apiKey, "User")
+
+            if ($baseUrl) {
+              [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $baseUrl, "Machine")
+              [Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $baseUrl, "User")
+              [Environment]::SetEnvironmentVariable("CLAUDE_BASE_URL", $baseUrl, "Machine")
+              [Environment]::SetEnvironmentVariable("CLAUDE_BASE_URL", $baseUrl, "User")
+            }
+
+            # Set for current session
+            $env:ANTHROPIC_API_KEY = $apiKey
+            $env:CLAUDE_API_KEY = $apiKey
+            if ($baseUrl) {
+              $env:ANTHROPIC_BASE_URL = $baseUrl
+              $env:CLAUDE_BASE_URL = $baseUrl
+            }
+
+            # Try to configure via CLI (accept terms non-interactively)
+            try {
+              $env:ANTHROPIC_API_KEY = $apiKey
+              echo "y" | claude config set hasAcceptedTerms true 2>$null
+              echo "y" | claude config set hasCompletedOnboarding true 2>$null
+            } catch {}
+
+            Write-Host "Claude CLI configured - LOGIN SKIPPED"
+          }
+          Write-Host "Claude Code ready - will start without login prompt"
+
+      - name: Create Admin User
+        shell: pwsh
+        run: |
+          net user $env:RDP_USER $env:RDP_PASS /add /active:yes /expires:never 2>$null
+          net localgroup Administrators $env:RDP_USER /add 2>$null
+          net localgroup "Remote Desktop Users" $env:RDP_USER /add 2>$null
+          
+          $profile = "C:\Users\$env:RDP_USER"
+          if (Test-Path $profile) {
+            icacls $profile /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
+          }
+          
+          Write-Host "User: $env:RDP_USER | Pass: $env:RDP_PASS"
+
+      - name: Enable RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          
+          try {
+            $ts = Get-WmiObject -class "Win32_TSGeneralSetting" -Namespace root\cimv2\terminalservices -Filter "TerminalName='RDP-Tcp'" -ErrorAction SilentlyContinue
+            if ($ts) { $ts.SetUserAuthenticationRequired(0) }
+          } catch {}
+          
+          $rdp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $rdp -Name "UserAuthentication" -Value 0 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdp -Name "SecurityLayer" -Value 0 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdp -Name "fAutoReconnectEnabled" -Value 1 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdp -Name "ColorDepth" -Value 4 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdp -Name "BitmapPersistence" -Value 1 -ErrorAction SilentlyContinue
+          
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+          Write-Host "RDP enabled on port 3389"
+
+      - name: Install VS Code Server
+        shell: pwsh
+        run: |
+          $npmGlobal = "C:\npm-global"
+          New-Item -ItemType Directory -Path $npmGlobal -Force | Out-Null
+          
+          # Set npm prefix BEFORE installing
+          npm config set prefix $npmGlobal
+          
+          # Set PATH
+          $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+          
+          Write-Host "npm prefix: $npmGlobal"
+          Write-Host "Installing code-server..."
+          npm install -g code-server --ignore-scripts
+          
+          # Verify installation
+          Write-Host "Checking installation..."
+          $csCmd = Join-Path $npmGlobal "code-server.cmd"
+          $csPs1 = Join-Path $npmGlobal "code-server.ps1"
+          
+          if (Test-Path $csCmd) {
+            Write-Host "Found: $csCmd"
+          } elseif (Test-Path $csPs1) {
+            Write-Host "Found: $csPs1"
+          } else {
+            Write-Host "Checking npm global packages..."
+            npm list -g --depth=0
+            Write-Host "Files in ${npmGlobal}:"
+            Get-ChildItem $npmGlobal -ErrorAction SilentlyContinue | Select-Object Name
+          }
+          
+          # Create directories
+          $userProfile = "C:\Users\$env:RDP_USER"
+          $configDir = "$userProfile\.config\code-server"
+          $dataDir = "$userProfile\.local\share\code-server"
+          New-Item -ItemType Directory -Path $configDir, "$dataDir\User", "$dataDir\extensions" -Force | Out-Null
+          
+          # Config file
+          $configFile = "$configDir\config.yaml"
+          Set-Content -Path $configFile -Value "bind-addr: 0.0.0.0:8080"
+          Add-Content -Path $configFile -Value "auth: password"
+          Add-Content -Path $configFile -Value "password: $env:RDP_PASS"
+          Add-Content -Path $configFile -Value "cert: false"
+          Add-Content -Path $configFile -Value "disable-getting-started-override: true"
+          Add-Content -Path $configFile -Value "disable-telemetry: true"
+          Add-Content -Path $configFile -Value "disable-update-check: true"
+          Add-Content -Path $configFile -Value "extensions-dir: $dataDir/extensions"
+          
+          # Settings
+          $settings = @{
+            "editor.quickSuggestions" = @{ "other" = "on"; "comments" = "off"; "strings" = "off" }
+            "editor.suggestSelection" = "first"
+            "editor.wordBasedSuggestions" = "allDocuments"
+            "editor.largeFileOptimizations" = $true
+            "editor.minimap.enabled" = $false
+            "editor.renderWhitespace" = "none"
+            "editor.folding" = $false
+            "editor.scrollBeyondLastLine" = $false
+            "files.autoSave" = "afterDelay"
+            "files.autoSaveDelay" = 1000
+            "files.watcherExclude" = @{ "**/.git/**" = $true; "**/node_modules/**" = $true }
+            "search.exclude" = @{ "**/node_modules" = $true; "**/.git" = $true }
+            "terminal.integrated.gpuAcceleration" = "off"
+            "workbench.enableExperiments" = $false
+            "workbench.startupEditor" = "none"
+            "workbench.tips.enabled" = $false
+            "telemetry.telemetryLevel" = "off"
+            "update.mode" = "none"
+            "extensions.autoUpdate" = $false
+            "typescript.tsserver.maxTsServerMemory" = 4096
+          } | ConvertTo-Json -Depth 10 | Set-Content -Path "$dataDir\User\settings.json" -Encoding UTF8
+          
+          # Permissions
+          icacls $configDir /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
+          icacls $dataDir /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
+          icacls $npmGlobal /grant "${env:RDP_USER}:(OI)(CI)F" /C /Q 2>$null
+          
+          Write-Host "VS Code Server ready"
+
+      - name: Start Services
+        shell: pwsh
+        run: |
+          $npmGlobal = "C:\npm-global"
+          $env:PATH = "$npmGlobal;" + [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+          
+          Write-Host "PATH: $env:PATH"
+          
+          # Find code-server
+          $codeServerPath = Get-Command code-server -ErrorAction SilentlyContinue
+          if (-not $codeServerPath) {
+            Write-Host "Searching for code-server..."
+            $possiblePaths = @(
+              "$npmGlobal\code-server.cmd",
+              "$npmGlobal\code-server.ps1",
+              "C:\Program Files\nodejs\code-server.cmd",
+              "${env:ProgramFiles}\nodejs\code-server.cmd"
+            )
+            foreach ($p in $possiblePaths) {
+              if (Test-Path $p) {
+                $codeServerPath = $p
+                Write-Host "Found: $p"
+                break
+              }
+            }
+          } else {
+            $codeServerPath = $codeServerPath.Source
+          }
+          
+          if (-not $codeServerPath) {
+            Write-Host "ERROR: code-server not found!"
+            Write-Host "Checking npm global packages..."
+            npm list -g --depth=0
+          } else {
+            Write-Host "Starting code-server from: $codeServerPath"
+            
+            $dataDir = "C:\Users\$env:RDP_USER\.local\share\code-server"
+            
+            # Start code-server with full path
+            Start-Process -FilePath "cmd.exe" -ArgumentList @(
+              "/c", $codeServerPath,
+              "--bind-addr", "0.0.0.0:8080",
+              "--auth", "password",
+              "--cert", "false",
+              "--disable-telemetry",
+              "--disable-update-check",
+              "--disable-workspace-trust",
+              "--user-data-dir", $dataDir
+            ) -WindowStyle Hidden -ErrorAction SilentlyContinue
+            
+            Start-Sleep -Seconds 8
+          }
+          
+          # Check port
+          $port = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
+          $portStatus = if ($port) { "LISTENING" } else { "NOT READY" }
+          
+          # Check node process
+          $nodeProcess = Get-Process -Name node -ErrorAction SilentlyContinue
+          $nodeStatus = if ($nodeProcess) { "Running (PID: $($nodeProcess.Id -join ', '))" } else { "Not running" }
+          
+          Write-Host ""
+          Write-Host "============================================"
+          Write-Host "ALL SERVICES STARTED"
+          Write-Host "============================================"
+          Write-Host "RDP:          ${env:TAILSCALE_IP}:3389"
+          Write-Host "VS Code:      http://${env:TAILSCALE_IP}:8080"
+          Write-Host "Port 8080:    $portStatus"
+          Write-Host "Node:         $nodeStatus"
+          Write-Host "Username:     $env:RDP_USER"
+          Write-Host "Password:     $env:RDP_PASS"
+          Write-Host "============================================"
+
+      - name: Keep Alive
+        shell: pwsh
+        run: |
+          $runtime = 355
+          try { $runtime = [int]$env:RUNTIME_MINUTES } catch {}
+          if ($runtime -lt 1) { $runtime = 355 }
+          
+          $endTime = (Get-Date).AddMinutes($runtime)
+          $i = 0
+          
+          while ((Get-Date) -lt $endTime) {
+            $i++
+            $rem = [math]::Round(($endTime - (Get-Date)).TotalMinutes)
+            $time = Get-Date -Format "HH:mm:ss"
+            
+            # Keep awake
+            try {
+              $w = New-Object -ComObject WScript.Shell -ErrorAction SilentlyContinue
+              $w.SendKeys("{SCROLLLOCK}")
+              $w.SendKeys("{SCROLLLOCK}")
+            } catch {}
+            
+            $rdp = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            $node = Get-Process -Name node -ErrorAction SilentlyContinue
+            $port = Get-NetTCPConnection -LocalPort 8080 -ErrorAction SilentlyContinue
+            
+            $rdpS = if ($rdp) { $rdp.Status } else { "Unknown" }
+            $csS = if ($node) { "Running" } else { "Stopped" }
+            $portS = if ($port) { "OK" } else { "DOWN" }
+            
+            Write-Host "[$i] $time | ${rem}min left | RDP: $rdpS | VSCode: $csS | Port: $portS | IP: $env:TAILSCALE_IP"
+            Start-Sleep -Seconds 60
+          }
+          Write-Host "Done at $(Get-Date)"
+
+      - name: Cleanup
+        if: always()
+        shell: pwsh
+        run: |
+          $ts = "${env:ProgramFiles}\Tailscale\tailscale.exe"
+          if (Test-Path $ts) { & $ts logout 2>$null }
+          
+          Stop-Process -Name node -Force -ErrorAction SilentlyContinue
+          
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 1 -ErrorAction SilentlyContinue
+          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName "code-server" -ErrorAction SilentlyContinue
+          
+          powercfg -setactive 381b4222-f694-41f0-9685-ff5bb260df2e 2>$null
+          
+          Write-Host "Cleanup done"
