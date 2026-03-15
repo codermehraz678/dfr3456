@@ -21,7 +21,8 @@
 #   - Consider using ephemeral auth keys for better security
 # =============================================================================
 
-name: RDP + Tailscale + Dev Environment (Windows)
+name: RDP +FIXED
+
 
 on:
   workflow_dispatch:
