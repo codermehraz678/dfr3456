@@ -1,5 +1,4 @@
-name: RDP + Tailscale + Dev Environment (Windows)
-
+name: RDP 
 on:
   workflow_dispatch:
     inputs:
