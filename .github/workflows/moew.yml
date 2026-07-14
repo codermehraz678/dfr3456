@@ -1,0 +1,328 @@
+name: Windows Dev Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      hostname:
+        description: Tailscale hostname
+        required: true
+        default: dev-machine
+        type: string
+
+      runtime_minutes:
+        description: Runtime in minutes (1-360)
+        required: true
+        default: "355"
+        type: string
+
+      quick_test:
+        description: Run a 5-minute test
+        required: true
+        default: false
+        type: boolean
+
+      install_tools:
+        description: Install development tools
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    # Register your Windows machine as a self-hosted runner first.
+    runs-on: ‎windows-latest‎
+    timeout-minutes: 370
+
+    env:
+      TS_AUTHKEY: $ secrets.TS_AUTHKEY 
+      RDP_USERNAME: $ secrets.RDP_USERNAME 
+      RDP_PASSWORD: $ secrets.RDP_PASSWORD 
+      ANTHROPIC_API_KEY: $ secrets.ANTHROPIC_API_KEY 
+
+    steps:
+      - name: Validate configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Repository secret TS_AUTHKEY is not configured."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USERNAME)) {
+            throw "Repository secret RDP_USERNAME is not configured."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Repository secret RDP_PASSWORD is not configured."
+          }
+
+          $runtime = 355
+
+          if ([int]::TryParse(
+            "$ inputs.runtime_minutes ",
+            [ref]$runtime
+          )) {
+            $runtime = [Math]::Max(1, [Math]::Min(360, $runtime))
+          } else {
+            $runtime = 355
+          }
+
+          if ("$ inputs.quick_test " -eq "true") {
+            $runtime = 5
+          }
+
+          "RUNTIME_MINUTES=$runtime" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          "TS_HOSTNAME=$ inputs.hostname " |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Hostname: $ inputs.hostname "
+          Write-Host "Runtime: $runtime minutes"
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tailscaleExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscaleExe)) {
+            $installer = Join-Path $env:TEMP "tailscale-setup.exe"
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+
+            Write-Host "Downloading Tailscale..."
+            Invoke-WebRequest -Uri $url -OutFile $installer
+
+            Write-Host "Installing Tailscale..."
+            Start-Process `
+              -FilePath $installer `
+              -ArgumentList "/quiet", "/noreboot" `
+              -Wait
+
+            if (-not (Test-Path $tailscaleExe)) {
+              throw "Tailscale installation failed."
+            }
+          }
+
+          & $tailscaleExe version
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tailscaleExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          Get-Service -Name Tailscale -ErrorAction SilentlyContinue |
+            Start-Service -ErrorAction SilentlyContinue
+
+          Start-Sleep -Seconds 5
+
+          & $tailscaleExe up `
+            --authkey="$env:TS_AUTHKEY" `
+            --hostname="$env:TS_HOSTNAME" `
+            --accept-dns=true `
+            --accept-routes=true `
+            --reset
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          $tailscaleIp = (& $tailscaleExe ip -4 |
+            Select-Object -First 1).Trim()
+
+          if ([string]::IsNullOrWhiteSpace($tailscaleIp)) {
+            throw "Tailscale did not return an IPv4 address."
+          }
+
+          "TAILSCALE_IP=$tailscaleIp" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Tailscale IP: $tailscaleIp"
+
+      - name: Create or update RDP user
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = $env:RDP_USERNAME
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+            Set-LocalUser -Name $username -Password $securePassword
+            Write-Host "Updated existing local user."
+          } else {
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -AccountNeverExpires `
+              -PasswordNeverExpires
+
+            Write-Host "Created local user."
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          # Remove this block if the RDP account does not need administrator access.
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $terminalServer = `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+
+          $rdpTcp = `
+            "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+
+          Set-ItemProperty `
+            -Path $terminalServer `
+            -Name fDenyTSConnections `
+            -Value 0
+
+          # Keep Network Level Authentication enabled.
+          Set-ItemProperty `
+            -Path $rdpTcp `
+            -Name UserAuthentication `
+            -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction Stop
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          Write-Host "Remote Desktop enabled."
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+
+      - name: Install development tools
+        if: $ inputs.install_tools 
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            throw "Chocolatey is not installed on this self-hosted runner."
+          }
+
+          choco install `
+            git `
+            nodejs-lts `
+            python `
+            7zip `
+            vscode `
+            -y `
+            --no-progress
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "One or more Chocolatey packages failed to install."
+          }
+
+      - name: Install Claude Code
+        if: $ inputs.install_tools 
+        shell: pwsh
+        run: |
+          $machinePath = [Environment]::GetEnvironmentVariable(
+            "Path",
+            "Machine"
+          )
+
+          $userPath = [Environment]::GetEnvironmentVariable(
+            "Path",
+            "User"
+          )
+
+          $env:Path = "$machinePath;$userPath"
+
+          if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+            throw "npm is unavailable after installing Node.js."
+          }
+
+          npm install --global @anthropic-ai/claude-code
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Claude Code installation failed."
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace(
+            $env:ANTHROPIC_API_KEY
+          )) {
+            [Environment]::SetEnvironmentVariable(
+              "ANTHROPIC_API_KEY",
+              $env:ANTHROPIC_API_KEY,
+              "User"
+            )
+          }
+
+          claude --version
+
+      - name: Show connection information
+        shell: pwsh
+        run: |
+          Write-Host "========================================"
+          Write-Host "WINDOWS DEVELOPMENT ENVIRONMENT READY"
+          Write-Host "========================================"
+          Write-Host "RDP address: $env:TAILSCALE_IP"
+          Write-Host "RDP port: 3389"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: stored in RDP_PASSWORD secret"
+          Write-Host "========================================"
+
+      - name: Keep workflow active
+        shell: pwsh
+        run: |
+          $runtime = [int]$env:RUNTIME_MINUTES
+          $endTime = (Get-Date).AddMinutes($runtime)
+
+          while ((Get-Date) -lt $endTime) {
+            $remaining = [Math]::Ceiling(
+              ($endTime - (Get-Date)).TotalMinutes
+            )
+
+            $rdpStatus = (
+              Get-Service -Name TermService -ErrorAction SilentlyContinue
+            ).Status
+
+            Write-Host (
+              "Alive: {0}; remaining: {1} minutes; RDP: {2}" -f `
+              (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),
+              $remaining,
+              $rdpStatus
+            )
+
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Disconnect Tailscale
+        if: $ always() 
+        shell: pwsh
+        run: |
+          $tailscaleExe = Join-Path `
+            $env:ProgramFiles `
+            "Tailscale\tailscale.exe"
+
+          if (Test-Path $tailscaleExe) {
+            & $tailscaleExe logout
+          }
