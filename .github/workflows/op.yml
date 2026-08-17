@@ -693,44 +693,7 @@ jobs:
           Write-Host "Node.js Ready!"
           Write-Host "============================================"
 
-      # =======================================================================
-      # Step 10: Install Bonsai CLI (Optional)
-      # =======================================================================
-      - name: Install Bonsai CLI
-        shell: pwsh
-        env:
-          BONSAI_API_KEY: ${{ inputs.bonsai_api_key }}
-        run: |
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-
-          # Bonsai CLI is optional - capture output, surface only on failure so the
-          # log stays clean, but no longer swallow errors silently with 2>$null.
-          Write-Host "Installing Bonsai CLI (optional)..."
-          $out = npm install -g @bonsai-ai/cli --no-progress --no-fund --no-audit --loglevel=error 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::warning::Bonsai CLI install failed (exit $LASTEXITCODE). Continuing since it's optional. Output:"
-            $out | ForEach-Object { Write-Host "    $_" }
-          } else {
-            Write-Host "[OK] Bonsai CLI installed"
-          }
-
-          # Configure Bonsai API key if provided
-          if (-not [string]::IsNullOrEmpty($env:BONSAI_API_KEY)) {
-            $bonsaiDir = "$env:USERPROFILE\.bonsai"
-            New-Item -ItemType Directory -Path $bonsaiDir -Force | Out-Null
-            Set-Content -Path "$bonsaiDir\config" -Value "API_KEY=$env:BONSAI_API_KEY" -Encoding ascii
-
-            $userBonsaiDir = "C:\Users\$env:RDP_USER\.bonsai"
-            New-Item -ItemType Directory -Path $userBonsaiDir -Force | Out-Null
-            Set-Content -Path "$userBonsaiDir\config" -Value "API_KEY=$env:BONSAI_API_KEY" -Encoding ascii
-
-            Write-Host "Bonsai CLI configured with API key"
-          }
-
-          Write-Host "============================================"
-          Write-Host "Bonsai CLI Ready!"
-          Write-Host "============================================"
-
+      
       # =======================================================================
       # Step 11: Install VS Code Desktop + Remote Tunnel
       # =======================================================================
