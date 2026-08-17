@@ -93,15 +93,10 @@ jobs:
           if [ "$n" -lt 1 ]; then n=1; fi
           if [ "$n" -gt 10 ]; then n=10; fi
 
-          include="["
-          for i in $(seq 1 "$n"); do
-            if [ "$i" -gt 1 ]; then include+=","; fi
-            include+="{\"id\": $i}"
-          done
-          include+="]"
-
-          echo "matrix={\"include\":$include}" >> "$GITHUB_OUTPUT"
-          echo "Matrix: $include"
+          # Use jq for robust JSON generation (avoids escaping issues)
+          matrix=$(jq -c -n --argjson n "$n" '{include: [range(1; $n+1) | {id: .}]}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $matrix"
 
   # ===========================================================================
   # Purge Devices Job: Remove old Tailscale devices matching hostname
@@ -118,14 +113,20 @@ jobs:
           HOSTNAME_INPUT: ${{ inputs.hostname }}
         shell: bash
         run: |
+          set -e
           hostname_pattern="${HOSTNAME_INPUT:-bullet}"
           
-          # Fetch all devices from Tailscale
+          # Fetch all devices from Tailscale ('-' uses the tailnet of the API key safely)
           devices=$(curl -s -H "Authorization: Bearer $TS_API_KEY" \
-            "https://api.tailscale.com/api/v2/tailnet/$TS_TAILNET/devices")
+            "https://api.tailscale.com/api/v2/tailnet/-/devices")
           
-          # Delete devices matching the hostname pattern
-          echo "$devices" | jq -r ".devices[] | select(.hostname | test(\"$hostname_pattern\")) | .id" | while read -r device_id; do
+          if [ -z "$devices" ] || [ "$devices" = "null" ]; then
+            echo "Failed to fetch devices or empty list"
+            exit 0
+          fi
+
+          # Delete devices matching the hostname pattern (using 'contains' instead of regex 'test')
+          echo "$devices" | jq -r --arg pat "$hostname_pattern" '.devices[] | select(.hostname | contains($pat)) | .id' | while read -r device_id; do
             if [ -n "$device_id" ]; then
               echo "Deleting device: $device_id"
               curl -s -X DELETE \
@@ -411,10 +412,10 @@ jobs:
           # Silence verbose download/progress output from Chocolatey
           $env:chocolateyUseCompression = 'false'
 
-          Write-Host "Installing Chocolatey packages (git, wget, vim, nano, nodejs-lts, python3, 7zip)..."
+          Write-Host "Installing Chocolatey packages (git, wget, vim, nano, python3, 7zip)..."
           # --no-progress hides the per-package "Saving X of Y MB" lines
           # --limit-output keeps the log concise; -y auto-confirms
-          choco install -y --no-progress --limit-output git wget vim nano nodejs-lts python3 7zip
+          choco install -y --no-progress --limit-output git wget vim nano python3 7zip
 
           # Refresh environment variables (newly installed tools may have added to Machine PATH)
           $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
@@ -444,14 +445,10 @@ jobs:
           Write-Host "INSTALLING CLAUDE CODE"
           Write-Host "============================================"
 
-          # Silence npm's progress/verbose output; keep stderr for diagnostics
-          $npmArgs = @('--no-progress', '--no-fund', '--no-audit', '--loglevel=error')
-
           function Invoke-QuietCommand {
             param(
               [scriptblock]$Action,
-              [string]$Label,
-              [string[]]$FailedMarker = @()
+              [string]$Label
             )
             # Capture combined output so the log stays clean; surface it only on failure.
             $out = & $Action 2>&1
@@ -467,32 +464,12 @@ jobs:
             return $false
           }
 
-          # Refresh PATH to ensure npm is available
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-
           $claudeInstalled = $false
 
-          # Method 1: npm install (RECOMMENDED - most reliable)
-          Write-Host "Installing Claude Code via npm..."
-          $claudeInstalled = Invoke-QuietCommand -Label "npm install @anthropic-ai/claude-code" -Action {
-            npm install -g @anthropic-ai/claude-code @npmArgs
-          }
-
-          # Method 2: Try winget as fallback
-          if (-not $claudeInstalled) {
-            Write-Host "Attempting to install Claude Code via winget..."
-            $claudeInstalled = Invoke-QuietCommand -Label "winget install Anthropic.ClaudeCode" -Action {
-              winget install --id Anthropic.ClaudeCode --accept-source-agreements --accept-package-agreements --disable-interactivity
-            }
-          }
-
-          # Method 3: Retry npm with --force as last resort
-          if (-not $claudeInstalled) {
-            Write-Host "Retrying npm install with --force..."
-            $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-            $claudeInstalled = Invoke-QuietCommand -Label "npm install @anthropic-ai/claude-code --force" -Action {
-              npm install -g @anthropic-ai/claude-code --force @npmArgs
-            }
+          # Install via winget (reliable non-npm method)
+          Write-Host "Attempting to install Claude Code via winget..."
+          $claudeInstalled = Invoke-QuietCommand -Label "winget install Anthropic.ClaudeCode" -Action {
+            winget install --id Anthropic.ClaudeCode --accept-source-agreements --accept-package-agreements --disable-interactivity
           }
 
           # Configure Claude API key if provided
@@ -540,7 +517,7 @@ jobs:
             }
           } else {
             Write-Host "::warning::claude command not found in PATH after install."
-            Write-Host "Note: you may need to restart the shell or install manually with: npm install -g @anthropic-ai/claude-code"
+            Write-Host "Note: you may need to restart the shell or install manually via winget"
           }
 
           Write-Host ""
@@ -590,11 +567,9 @@ jobs:
           # Add to Users group
           net localgroup Users $username /add 2>$null
           
-          # Disable password expiration using PowerShell (wmic is deprecated)
+          # Disable password expiration using modern PowerShell cmdlet
           try {
-            $adsi = [ADSI]"WinNT://$env:COMPUTERNAME/$username,user"
-            $adsi.UserFlags.value = $adsi.UserFlags.value -bor 0x10000
-            $adsi.CommitChanges()
+            Set-LocalUser -Name $username -PasswordNeverExpires $true -ErrorAction Stop
             Write-Host "Password expiration disabled"
           } catch {
             Write-Host "Note: Could not disable password expiration (may need manual setup)"
@@ -627,15 +602,7 @@ jobs:
           # Enable RDP firewall rule
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           
-          # Disable Network Level Authentication for better compatibility
-          try {
-            $ts = Get-WmiObject -class "Win32_TSGeneralSetting" -Namespace root\cimv2\terminalservices -Filter "TerminalName='RDP-Tcp'" -ErrorAction SilentlyContinue
-            if ($ts) { 
-              $ts.SetUserAuthenticationRequired(0) 
-            }
-          } catch {}
-          
-          # Configure RDP security settings
+          # Disable Network Level Authentication for better compatibility via Registry
           $rdpTcpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
           Set-ItemProperty -Path $rdpTcpPath -Name "UserAuthentication" -Value 0 -Force -ErrorAction SilentlyContinue
           Set-ItemProperty -Path $rdpTcpPath -Name "SecurityLayer" -Value 0 -Force -ErrorAction SilentlyContinue
@@ -668,37 +635,7 @@ jobs:
           Write-Host "============================================"
 
       # =======================================================================
-      # Step 9: Install Node.js and Global Packages
-      # =======================================================================
-      - name: Install Node.js + npm packages
-        shell: pwsh
-        run: |
-          # Refresh PATH
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-
-          Write-Host "Node: $(node --version)  |  npm: $(npm --version)"
-
-          # Install global npm packages quietly (--no-progress hides "Saving X of Y MB",
-          # --no-fund/--no-audit skip the funding/vuln notices, --loglevel=error keeps it terse)
-          $packages = @('typescript', 'ts-node', 'nodemon', 'pm2', 'yarn', 'pnpm')
-          Write-Host "Installing global npm packages: $($packages -join ', ')"
-          $out = npm install -g --no-progress --no-fund --no-audit --loglevel=error @packages 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::Global npm install failed (exit $LASTEXITCODE). Output:"
-            $out | ForEach-Object { Write-Host "    $_" }
-            exit 1
-          }
-
-          Write-Host "============================================"
-          Write-Host "Node.js Ready!"
-          Write-Host "============================================"
-
-      
-      # =======================================================================
-      # Step 11: Install VS Code Desktop + Remote Tunnel
-      # =======================================================================
-      # NOTE: code-server npm package has known issues on Windows (GitHub issues #7089, #7093, #7280)
-      # Using VS Code Desktop with Remote Tunnel is more reliable for Windows
+      # Step 9: Install VS Code Desktop + Remote Tunnel
       # =======================================================================
       - name: Install VS Code Desktop + Remote Tunnel
         shell: pwsh
@@ -824,7 +761,7 @@ jobs:
           Write-Host "============================================"
 
       # =======================================================================
-      # Step 12: Start All Services
+      # Step 10: Start All Services
       # =======================================================================
       - name: Start Services
         shell: pwsh
@@ -875,7 +812,6 @@ jobs:
           Write-Host ""
           Write-Host "INSTALLED TOOLS:"
           Write-Host "  - VS Code Desktop (with extensions)"
-          Write-Host "  - Node.js + npm"
           Write-Host "  - Python 3"
           Write-Host "  - Git"
           Write-Host "  - Claude Code CLI"
@@ -890,7 +826,7 @@ jobs:
           Write-Host "============================================"
 
       # =======================================================================
-      # Step 13: Keep Alive Loop
+      # Step 11: Keep Alive Loop
       # =======================================================================
       - name: Keep alive
         shell: pwsh
@@ -937,7 +873,7 @@ jobs:
           Write-Host "Runtime completed at $(Get-Date)"
 
       # =======================================================================
-      # Step 14: Cleanup on Exit
+      # Step 12: Cleanup on Exit
       # =======================================================================
       - name: Cleanup on exit
         if: always()
