@@ -1,4 +1,4 @@
-name: Remote Desktop opopopoppppppopo
+name: Remote Desktop
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
 
 jobs:
   desktop:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - name: Install XFCE4
@@ -38,7 +38,7 @@ jobs:
       - name: Configure RDP user
         run: |
           set -euo pipefail
-          PASSWORD="$(openssl rand -base64 16)"
+          PASSWORD='Bullet@12345'
           if ! id -u rdpuser >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash rdpuser
           fi
