@@ -1,0 +1,86 @@
+name: Remote Desktop opopopoppppppopo
+
+on:
+  workflow_dispatch:
+    inputs:
+      tailscale_authkey:
+        description: "Tailscale reusable auth key"
+        required: true
+        type: string
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install XFCE4
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo --preserve-env=DEBIAN_FRONTEND apt-get update -y >/dev/null 2>&1
+          sudo --preserve-env=DEBIAN_FRONTEND apt-get install -y xfce4 xfce4-goodies dbus-x11 xorg >/dev/null 2>&1
+          echo "✅ XFCE4 installed"
+
+      - name: Install XRDP
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo --preserve-env=DEBIAN_FRONTEND apt-get install -y xrdp xorgxrdp >/dev/null 2>&1
+          echo "startxfce4" | sudo tee /etc/skel/.xsession >/dev/null
+          sudo sed -i 's|^test -x /etc/X11/Xsession && exec /etc/X11/Xsession|#test -x /etc/X11/Xsession \&\& exec /etc/X11/Xsession|' /etc/xrdp/startwm.sh
+          sudo sed -i 's|^exec /bin/sh /etc/X11/Xsession|#exec /bin/sh /etc/X11/Xsession|' /etc/xrdp/startwm.sh
+          grep -qxF 'startxfce4' /etc/xrdp/startwm.sh || echo 'startxfce4' | sudo tee -a /etc/xrdp/startwm.sh >/dev/null
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1
+          sudo systemctl restart xrdp >/dev/null 2>&1
+          echo "✅ XRDP installed"
+
+      - name: Configure RDP user
+        run: |
+          set -euo pipefail
+          PASSWORD="$(openssl rand -base64 16)"
+          if ! id -u rdpuser >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash rdpuser
+          fi
+          echo "rdpuser:${PASSWORD}" | sudo chpasswd
+          echo "startxfce4" | sudo tee /home/rdpuser/.xsession >/dev/null
+          sudo chown rdpuser:rdpuser /home/rdpuser/.xsession
+          printf '%s' "${PASSWORD}" > "${RUNNER_TEMP}/rdp_password"
+          chmod 600 "${RUNNER_TEMP}/rdp_password"
+          echo "✅ RDP user configured"
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ inputs.tailscale_authkey }}
+          hostname: gha-rdp-${{ github.run_id }}
+
+      - name: Save connection details
+        run: |
+          set -euo pipefail
+          TS_IP="$(tailscale ip -4)"
+          HOST_NAME="$(hostname)"
+          PASSWORD="$(cat "${RUNNER_TEMP}/rdp_password")"
+          {
+            echo "IP: ${TS_IP}"
+            echo "Port: 3389"
+            echo "Username: rdpuser"
+            echo "Password: ${PASSWORD}"
+            echo "Hostname: ${HOST_NAME}"
+          } > "${RUNNER_TEMP}/connection-info.txt"
+          chmod 600 "${RUNNER_TEMP}/connection-info.txt"
+          rm -f "${RUNNER_TEMP}/rdp_password"
+          echo "✅ Connection details saved"
+
+      - name: Upload connection details
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-connection-info
+          path: ${{ runner.temp }}/connection-info.txt
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Keep runner alive
+        run: |
+          echo "✅ Runner will stay alive for up to 6 hours"
+          sleep 21600
